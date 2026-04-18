@@ -18,6 +18,10 @@ export interface SendConversationMessageParams {
   signal?: AbortSignal;
 }
 
+export interface SendConversationMessageOptions {
+  onAssistantEvent?: (message: ConversationMessage, stage: 'done' | 'start' | 'update') => void;
+}
+
 const getMessagesFromEntries = (entries: SessionEntry[]): Message[] =>
   entries
     .filter(
@@ -177,9 +181,22 @@ export const listConversationSessions = async (
   return loaded.map(toSessionSummary);
 };
 
+const emitAssistantEvent = (
+  assistant: AssistantMessage | null,
+  stage: 'done' | 'start' | 'update',
+  onAssistantEvent?: (message: ConversationMessage, stage: 'done' | 'start' | 'update') => void,
+): void => {
+  if (!assistant || !onAssistantEvent) {
+    return;
+  }
+
+  onAssistantEvent(toConversationMessage(assistant), stage);
+};
+
 export const sendConversationMessage = async (
   runtime: HarnessRuntime,
   params: SendConversationMessageParams,
+  options: SendConversationMessageOptions = {},
 ): Promise<SessionDetail> => {
   const provider = runtime.providerRegistry.get(params.providerId);
   if (!provider) {
@@ -199,6 +216,8 @@ export const sendConversationMessage = async (
   const loadedSession = await runtime.sessionManager.load(params.sessionId);
   const previousMessages = getMessagesFromEntries(loadedSession.entries);
   const userMessage = createUserMessage(params.prompt);
+  await runtime.sessionManager.appendMessage(params.sessionId, userMessage);
+
   let assistant: AssistantMessage | null = null;
 
   for await (const event of provider.transport.stream(
@@ -215,13 +234,34 @@ export const sendConversationMessage = async (
     },
   )) {
     assistant = getLatestAssistant(assistant, event);
+
+    switch (event.type) {
+      case 'start':
+        emitAssistantEvent(assistant, 'start', options.onAssistantEvent);
+        break;
+      case 'text_start':
+      case 'text_delta':
+      case 'text_end':
+      case 'thinking_start':
+      case 'thinking_delta':
+      case 'thinking_end':
+      case 'toolcall_start':
+      case 'toolcall_delta':
+      case 'toolcall_end':
+      case 'usage':
+        emitAssistantEvent(assistant, 'update', options.onAssistantEvent);
+        break;
+      case 'done':
+      case 'error':
+        emitAssistantEvent(assistant, 'done', options.onAssistantEvent);
+        break;
+    }
   }
 
   if (!assistant) {
     throw new ProviderError('Model stream finished without an assistant message.');
   }
 
-  await runtime.sessionManager.appendMessage(params.sessionId, userMessage);
   await runtime.sessionManager.appendMessage(params.sessionId, assistant);
 
   return loadConversationSession(runtime, params.sessionId);

@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
   shell,
   type IpcMainInvokeEvent,
@@ -28,6 +29,7 @@ import {
   type AuthOverview,
   type AuthProgressEvent,
   type AuthPromptRequest,
+  type ChatStreamEvent,
   type CreateSessionResult,
   type PromptRunRequest,
   type PromptRunResult,
@@ -35,21 +37,22 @@ import {
   type SendMessageResult,
   type SessionDetail,
   type SessionSummary,
+  type WorkspaceSelectionResult,
 } from '../shared/anvil-api';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const runtime = createHarnessRuntime();
-const workspacePath = process.cwd();
+let currentWorkspacePath = process.cwd();
 
-const runtimeSummary = {
+const createRuntimeSummary = () => ({
   platform: process.platform,
   versions: {
     chrome: process.versions.chrome,
     electron: process.versions.electron,
     node: process.versions.node,
   },
-  workspacePath,
-} as const;
+  workspacePath: currentWorkspacePath,
+});
 
 interface PendingAuthPrompt {
   reject(error: Error): void;
@@ -102,6 +105,14 @@ const emitAuthProgress = (webContents: WebContents, event: AuthProgressEvent): v
   webContents.send(ANVIL_IPC_CHANNELS.authProgress, event);
 };
 
+const emitChatStream = (webContents: WebContents, event: ChatStreamEvent): void => {
+  if (webContents.isDestroyed()) {
+    return;
+  }
+
+  webContents.send(ANVIL_IPC_CHANNELS.chatStream, event);
+};
+
 const requestAuthPrompt = (
   webContents: WebContents,
   providerId: string,
@@ -138,7 +149,7 @@ const createAuthOverview = async (): Promise<AuthOverview> => {
   const authRecords = await runtime.authStorage.load();
 
   return {
-    ...runtimeSummary,
+    ...createRuntimeSummary(),
     authFilePath: getHarnessPaths().authFilePath,
     providers: runtime.providerRegistry.list().map((provider) => {
       const record = authRecords[provider.id];
@@ -151,6 +162,27 @@ const createAuthOverview = async (): Promise<AuthOverview> => {
         name: provider.name,
       };
     }),
+  };
+};
+
+const getWorkspaceState = async (): Promise<{
+  detail: SessionDetail;
+  sessions: SessionSummary[];
+}> => {
+  const sessions = await listConversationSessions(runtime, currentWorkspacePath);
+  const firstSession = sessions[0];
+
+  if (firstSession) {
+    return {
+      detail: await loadConversationSession(runtime, firstSession.id),
+      sessions,
+    };
+  }
+
+  const detail = await createConversationSession(runtime, currentWorkspacePath);
+  return {
+    detail,
+    sessions: [detail.session],
   };
 };
 
@@ -215,15 +247,48 @@ ipcMain.handle(ANVIL_IPC_CHANNELS.authGetOverview, async () => createAuthOvervie
 
 ipcMain.handle(
   ANVIL_IPC_CHANNELS.chatListSessions,
-  async (): Promise<SessionSummary[]> => listConversationSessions(runtime, workspacePath),
+  async (): Promise<SessionSummary[]> => listConversationSessions(runtime, currentWorkspacePath),
 );
 
 ipcMain.handle(
   ANVIL_IPC_CHANNELS.chatCreateSession,
   async (): Promise<CreateSessionResult> => ({
-    detail: await createConversationSession(runtime, workspacePath),
+    detail: await createConversationSession(runtime, currentWorkspacePath),
   }),
 );
+
+ipcMain.handle(ANVIL_IPC_CHANNELS.workspaceSelect, async (): Promise<WorkspaceSelectionResult> => {
+  const result = mainWindow
+    ? await dialog.showOpenDialog(mainWindow, {
+        defaultPath: currentWorkspacePath,
+        properties: ['openDirectory'],
+        title: 'Select repository folder',
+      })
+    : await dialog.showOpenDialog({
+        defaultPath: currentWorkspacePath,
+        properties: ['openDirectory'],
+        title: 'Select repository folder',
+      });
+
+  const selectedPath = result.filePaths[0];
+  if (result.canceled || !selectedPath) {
+    return {
+      canceled: true,
+      workspacePath: currentWorkspacePath,
+    };
+  }
+
+  currentWorkspacePath = selectedPath;
+  const [overview, workspaceState] = await Promise.all([createAuthOverview(), getWorkspaceState()]);
+
+  return {
+    canceled: false,
+    detail: workspaceState.detail,
+    overview,
+    sessions: workspaceState.sessions,
+    workspacePath: currentWorkspacePath,
+  };
+});
 
 ipcMain.handle(
   ANVIL_IPC_CHANNELS.chatLoadSession,
@@ -233,17 +298,28 @@ ipcMain.handle(
 
 ipcMain.handle(
   ANVIL_IPC_CHANNELS.chatSendMessage,
-  async (_event: IpcMainInvokeEvent, request: SendMessageRequest): Promise<SendMessageResult> => {
+  async (event: IpcMainInvokeEvent, request: SendMessageRequest): Promise<SendMessageResult> => {
     try {
-      const detail = await sendConversationMessage(runtime, request);
+      const detail = await sendConversationMessage(runtime, request, {
+        onAssistantEvent: (message, stage) => {
+          emitChatStream(event.sender, {
+            message,
+            requestId: request.requestId,
+            sessionId: request.sessionId,
+            stage,
+          });
+        },
+      });
       return {
         detail,
         ok: true,
+        requestId: request.requestId,
       };
     } catch (error) {
       return {
         error: error instanceof Error ? error.message : String(error),
         ok: false,
+        requestId: request.requestId,
       };
     }
   },

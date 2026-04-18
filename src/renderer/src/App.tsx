@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import type {
   AuthActionResult,
@@ -85,13 +85,18 @@ export default function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null);
   const [composerText, setComposerText] = useState('');
-  const [pendingPrompt, setPendingPrompt] = useState<{ text: string; timestamp: number } | null>(
-    null,
-  );
+  const [pendingPrompt, setPendingPrompt] = useState<{
+    requestId: string;
+    text: string;
+    timestamp: number;
+  } | null>(null);
+  const [streamingAssistant, setStreamingAssistant] = useState<ConversationMessage | null>(null);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
   const [isBootstrapping, setIsBootstrapping] = useState(true);
   const [isLoadingSession, setIsLoadingSession] = useState(false);
+  const [isSwitchingWorkspace, setIsSwitchingWorkspace] = useState(false);
+  const pendingRequestIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -151,10 +156,23 @@ export default function App() {
       setAuthPromptValue('');
     });
 
+    const offChatStream = window.anvil.onChatStream((event) => {
+      if (event.requestId !== pendingRequestIdRef.current) {
+        return;
+      }
+
+      setStreamingAssistant(
+        event.message.text.trim().length > 0
+          ? event.message
+          : { ...event.message, text: 'Thinking…' },
+      );
+    });
+
     return () => {
       cancelled = true;
       offProgress();
       offPrompt();
+      offChatStream();
     };
   }, []);
 
@@ -181,7 +199,7 @@ export default function App() {
         text: pendingPrompt.text,
         timestamp: pendingPrompt.timestamp,
       },
-      {
+      streamingAssistant ?? {
         id: 'pending-assistant',
         role: 'assistant' as const,
         stopReason: 'stop' as const,
@@ -189,11 +207,14 @@ export default function App() {
         timestamp: pendingPrompt.timestamp,
       },
     ];
-  }, [pendingPrompt, sessionDetail]);
+  }, [pendingPrompt, sessionDetail, streamingAssistant]);
 
   const loadSession = async (sessionId: string): Promise<void> => {
     setIsLoadingSession(true);
     setChatError(null);
+    setPendingPrompt(null);
+    setStreamingAssistant(null);
+    pendingRequestIdRef.current = null;
 
     try {
       const detail = await window.anvil.loadSession(sessionId);
@@ -209,6 +230,9 @@ export default function App() {
 
   const handleCreateSession = async (): Promise<void> => {
     setChatError(null);
+    setPendingPrompt(null);
+    setStreamingAssistant(null);
+    pendingRequestIdRef.current = null;
 
     try {
       const created = await window.anvil.createSession();
@@ -217,6 +241,31 @@ export default function App() {
       setSessions((current) => upsertSession(current, created.detail.session));
     } catch (error) {
       setChatError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const handleSelectWorkspace = async (): Promise<void> => {
+    setIsSwitchingWorkspace(true);
+    setChatError(null);
+
+    try {
+      const result = await window.anvil.selectWorkspace();
+      if (result.canceled || !result.overview || !result.sessions || !result.detail) {
+        return;
+      }
+
+      setAuthOverview(result.overview);
+      setSessions(result.sessions);
+      setActiveSessionId(result.detail.session.id);
+      setSessionDetail(result.detail);
+      setComposerText('');
+      setPendingPrompt(null);
+      setStreamingAssistant(null);
+      pendingRequestIdRef.current = null;
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsSwitchingWorkspace(false);
     }
   };
 
@@ -282,8 +331,22 @@ export default function App() {
     }
 
     const prompt = composerText.trim();
+    const requestId =
+      typeof globalThis.crypto?.randomUUID === 'function'
+        ? globalThis.crypto.randomUUID()
+        : `request_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const timestamp = Date.now();
+
+    pendingRequestIdRef.current = requestId;
     setComposerText('');
-    setPendingPrompt({ text: prompt, timestamp: Date.now() });
+    setPendingPrompt({ requestId, text: prompt, timestamp });
+    setStreamingAssistant({
+      id: `stream-${requestId}`,
+      role: 'assistant',
+      stopReason: 'stop',
+      text: 'Thinking…',
+      timestamp,
+    });
     setIsSendingMessage(true);
     setChatError(null);
 
@@ -292,6 +355,7 @@ export default function App() {
         modelId: activeModel.id,
         prompt,
         providerId: connectedProvider.id,
+        requestId,
         sessionId: activeSessionId,
       });
 
@@ -299,14 +363,17 @@ export default function App() {
         throw new Error(result.error || 'Message send failed.');
       }
 
-      setSessionDetail(result.detail);
-      setSessions((current) => upsertSession(current, result.detail!.session));
-      setActiveSessionId(result.detail.session.id);
+      const detail = result.detail;
+      setSessionDetail(detail);
+      setSessions((current) => upsertSession(current, detail.session));
+      setActiveSessionId(detail.session.id);
     } catch (error) {
       setComposerText(prompt);
       setChatError(error instanceof Error ? error.message : String(error));
     } finally {
+      pendingRequestIdRef.current = null;
       setPendingPrompt(null);
+      setStreamingAssistant(null);
       setIsSendingMessage(false);
     }
   };
@@ -337,6 +404,16 @@ export default function App() {
                 : 'Connect OpenAI Codex'}
             </span>
           </div>
+          <button
+            className="button button-secondary"
+            disabled={isSwitchingWorkspace}
+            onClick={() => {
+              void handleSelectWorkspace();
+            }}
+            type="button"
+          >
+            {isSwitchingWorkspace ? 'Switching…' : 'Switch repo'}
+          </button>
         </div>
       </header>
 

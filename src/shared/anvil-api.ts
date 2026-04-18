@@ -10,7 +10,9 @@ export const ANVIL_IPC_CHANNELS = {
   chatListSessions: 'anvil:chat:list-sessions',
   chatLoadSession: 'anvil:chat:load-session',
   chatSendMessage: 'anvil:chat:send-message',
+  chatStream: 'anvil:chat:stream',
   promptRun: 'anvil:prompt:run',
+  workspaceSelect: 'anvil:workspace:select',
 } as const;
 
 export type AuthConnectionKind = 'api_key' | 'none' | 'oauth';
@@ -101,6 +103,7 @@ export interface SendMessageRequest {
   modelId: string;
   prompt: string;
   providerId: string;
+  requestId: string;
   sessionId: string;
 }
 
@@ -108,6 +111,14 @@ export interface SendMessageResult {
   detail?: SessionDetail;
   error?: string;
   ok: boolean;
+  requestId: string;
+}
+
+export interface ChatStreamEvent {
+  message: ConversationMessage;
+  requestId: string;
+  sessionId: string;
+  stage: 'done' | 'start' | 'update';
 }
 
 export interface PromptRunRequest {
@@ -126,6 +137,14 @@ export interface PromptRunResult {
   stopReason?: StopReason;
 }
 
+export interface WorkspaceSelectionResult {
+  canceled: boolean;
+  detail?: SessionDetail;
+  overview?: AuthOverview;
+  sessions?: SessionSummary[];
+  workspacePath?: string;
+}
+
 export interface AnvilBridge extends RuntimeSummary {
   cancelAuthPrompt(requestId: string): Promise<void>;
   createSession(): Promise<CreateSessionResult>;
@@ -136,7 +155,9 @@ export interface AnvilBridge extends RuntimeSummary {
   logout(providerId: string): Promise<AuthActionResult>;
   onAuthProgress(listener: (event: AuthProgressEvent) => void): () => void;
   onAuthPrompt(listener: (prompt: AuthPromptRequest) => void): () => void;
+  onChatStream(listener: (event: ChatStreamEvent) => void): () => void;
   runPrompt(request: PromptRunRequest): Promise<PromptRunResult>;
+  selectWorkspace(): Promise<WorkspaceSelectionResult>;
   sendMessage(request: SendMessageRequest): Promise<SendMessageResult>;
   submitAuthPrompt(requestId: string, value: string): Promise<void>;
 }

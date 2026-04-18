@@ -5,11 +5,13 @@ import {
   type AnvilBridge,
   type AuthProgressEvent,
   type AuthPromptRequest,
+  type ChatStreamEvent,
   type CreateSessionResult,
   type PromptRunResult,
   type SendMessageResult,
   type SessionDetail,
   type SessionSummary,
+  type WorkspaceSelectionResult,
 } from '../shared/anvil-api';
 
 const anvilBridge: AnvilBridge = {
@@ -70,8 +72,23 @@ const anvilBridge: AnvilBridge = {
       ipcRenderer.removeListener(ANVIL_IPC_CHANNELS.authPrompt, wrapped);
     };
   },
+  onChatStream(listener) {
+    const wrapped = (_event: Electron.IpcRendererEvent, payload: ChatStreamEvent) => {
+      listener(payload);
+    };
+
+    ipcRenderer.on(ANVIL_IPC_CHANNELS.chatStream, wrapped);
+    return () => {
+      ipcRenderer.removeListener(ANVIL_IPC_CHANNELS.chatStream, wrapped);
+    };
+  },
   runPrompt(request) {
     return ipcRenderer.invoke(ANVIL_IPC_CHANNELS.promptRun, request) as Promise<PromptRunResult>;
+  },
+  selectWorkspace() {
+    return ipcRenderer.invoke(
+      ANVIL_IPC_CHANNELS.workspaceSelect,
+    ) as Promise<WorkspaceSelectionResult>;
   },
   sendMessage(request) {
     return ipcRenderer.invoke(
