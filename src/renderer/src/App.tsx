@@ -44,14 +44,19 @@ const getConnectionLabel = (provider: AuthProviderSummary): string => {
   }
 
   if (provider.connectionKind === 'oauth') {
-    return 'Connected via OAuth';
+    return 'Connected';
   }
 
   if (provider.connectionKind === 'api_key') {
-    return 'Connected via API key';
+    return 'Connected via key';
   }
 
   return 'Connected';
+};
+
+const getWorkspaceName = (workspacePath: string): string => {
+  const segments = workspacePath.replaceAll('\\', '/').split('/').filter(Boolean);
+  return segments.at(-1) ?? workspacePath;
 };
 
 const upsertSession = (
@@ -74,6 +79,78 @@ const messageBody = (message: ConversationMessage): string => {
   return '(empty message)';
 };
 
+const messageLabel = (message: ConversationMessage): string => {
+  if (message.role === 'user') {
+    return 'You';
+  }
+
+  if (message.role === 'assistant') {
+    return 'Anvil';
+  }
+
+  return message.toolName || 'Tool';
+};
+
+const messageAvatar = (message: ConversationMessage): string => {
+  if (message.role === 'user') {
+    return 'Y';
+  }
+
+  if (message.role === 'assistant') {
+    return 'A';
+  }
+
+  return 'T';
+};
+
+const findRetryPrompt = (messages: ConversationMessage[], index: number): string | null => {
+  for (let currentIndex = index; currentIndex >= 0; currentIndex -= 1) {
+    const candidate = messages[currentIndex];
+    if (candidate?.role === 'user') {
+      const prompt = candidate.text.trim();
+      return prompt.length > 0 ? prompt : null;
+    }
+  }
+
+  return null;
+};
+
+const copyTextToClipboard = async (text: string): Promise<boolean> => {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Fall back to execCommand below.
+    }
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', 'true');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  textarea.style.pointerEvents = 'none';
+  document.body.append(textarea);
+  textarea.select();
+
+  const didCopy = document.execCommand('copy');
+  textarea.remove();
+  return didCopy;
+};
+
+const createPendingRequest = (): { requestId: string; timestamp: number } => {
+  const requestId =
+    typeof globalThis.crypto?.randomUUID === 'function'
+      ? globalThis.crypto.randomUUID()
+      : `request_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+  return {
+    requestId,
+    timestamp: Date.now(),
+  };
+};
+
 export default function App() {
   const [authOverview, setAuthOverview] = useState<AuthOverview | null>(null);
   const [authPrompt, setAuthPrompt] = useState<AuthPromptRequest | null>(null);
@@ -91,12 +168,19 @@ export default function App() {
     timestamp: number;
   } | null>(null);
   const [streamingAssistant, setStreamingAssistant] = useState<ConversationMessage | null>(null);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
   const [isBootstrapping, setIsBootstrapping] = useState(true);
   const [isLoadingSession, setIsLoadingSession] = useState(false);
   const [isSwitchingWorkspace, setIsSwitchingWorkspace] = useState(false);
   const pendingRequestIdRef = useRef<string | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const threadRef = useRef<HTMLDivElement | null>(null);
+  const threadEndRef = useRef<HTMLDivElement | null>(null);
+  const shouldStickToBottomRef = useRef(true);
+  const previousSessionIdRef = useRef<string | null>(null);
+  const copyResetTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -176,6 +260,27 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    const composer = composerRef.current;
+    if (!composer) {
+      return;
+    }
+
+    composer.style.height = '0px';
+    const nextHeight = Math.min(Math.max(composer.scrollHeight, 56), 220);
+    composer.style.height = `${nextHeight}px`;
+    composer.style.overflowY = composer.scrollHeight > 220 ? 'auto' : 'hidden';
+  }, [composerText]);
+
+  useEffect(
+    () => () => {
+      if (copyResetTimeoutRef.current !== null) {
+        window.clearTimeout(copyResetTimeoutRef.current);
+      }
+    },
+    [],
+  );
+
   const connectedProvider = useMemo(
     () =>
       authOverview?.providers.find(
@@ -184,7 +289,6 @@ export default function App() {
     [authOverview],
   );
   const activeModel = connectedProvider?.models[0] ?? null;
-  const orderedEvents = useMemo(() => events, [events]);
   const renderedMessages = useMemo(() => {
     const baseMessages = sessionDetail?.messages ?? [];
     if (!pendingPrompt) {
@@ -209,12 +313,40 @@ export default function App() {
     ];
   }, [pendingPrompt, sessionDetail, streamingAssistant]);
 
+  useEffect(() => {
+    const sessionChanged = previousSessionIdRef.current !== activeSessionId;
+    previousSessionIdRef.current = activeSessionId;
+
+    if (!threadEndRef.current) {
+      return;
+    }
+
+    if (sessionChanged || shouldStickToBottomRef.current) {
+      threadEndRef.current.scrollIntoView({ block: 'end' });
+    }
+  }, [activeSessionId, isBootstrapping, isLoadingSession, renderedMessages]);
+
+  const workspacePath = authOverview?.workspacePath ?? window.anvil.workspacePath;
+  const workspaceName = getWorkspaceName(workspacePath);
+  const canChat = Boolean(connectedProvider && activeModel && activeSessionId);
+
+  const handleThreadScroll = (): void => {
+    const thread = threadRef.current;
+    if (!thread) {
+      return;
+    }
+
+    const distanceFromBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight;
+    shouldStickToBottomRef.current = distanceFromBottom < 96;
+  };
+
   const loadSession = async (sessionId: string): Promise<void> => {
     setIsLoadingSession(true);
     setChatError(null);
     setPendingPrompt(null);
     setStreamingAssistant(null);
     pendingRequestIdRef.current = null;
+    shouldStickToBottomRef.current = true;
 
     try {
       const detail = await window.anvil.loadSession(sessionId);
@@ -233,6 +365,7 @@ export default function App() {
     setPendingPrompt(null);
     setStreamingAssistant(null);
     pendingRequestIdRef.current = null;
+    shouldStickToBottomRef.current = true;
 
     try {
       const created = await window.anvil.createSession();
@@ -262,6 +395,7 @@ export default function App() {
       setPendingPrompt(null);
       setStreamingAssistant(null);
       pendingRequestIdRef.current = null;
+      shouldStickToBottomRef.current = true;
     } catch (error) {
       setChatError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -319,26 +453,25 @@ export default function App() {
     setAuthPromptValue('');
   };
 
-  const handleSendMessage = async (): Promise<void> => {
-    if (
-      !connectedProvider ||
-      !activeModel ||
-      !activeSessionId ||
-      composerText.trim().length === 0 ||
-      isSendingMessage
-    ) {
+  const sendPrompt = async (
+    promptText: string,
+    options: { clearComposer: boolean; restoreComposerOnError: boolean },
+  ): Promise<void> => {
+    if (!connectedProvider || !activeModel || !activeSessionId || isSendingMessage) {
       return;
     }
 
-    const prompt = composerText.trim();
-    const requestId =
-      typeof globalThis.crypto?.randomUUID === 'function'
-        ? globalThis.crypto.randomUUID()
-        : `request_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const timestamp = Date.now();
+    const prompt = promptText.trim();
+    if (prompt.length === 0) {
+      return;
+    }
+
+    const { requestId, timestamp } = createPendingRequest();
 
     pendingRequestIdRef.current = requestId;
-    setComposerText('');
+    if (options.clearComposer) {
+      setComposerText('');
+    }
     setPendingPrompt({ requestId, text: prompt, timestamp });
     setStreamingAssistant({
       id: `stream-${requestId}`,
@@ -349,6 +482,7 @@ export default function App() {
     });
     setIsSendingMessage(true);
     setChatError(null);
+    shouldStickToBottomRef.current = true;
 
     try {
       const result = await window.anvil.sendMessage({
@@ -368,7 +502,9 @@ export default function App() {
       setSessions((current) => upsertSession(current, detail.session));
       setActiveSessionId(detail.session.id);
     } catch (error) {
-      setComposerText(prompt);
+      if (options.restoreComposerOnError) {
+        setComposerText(prompt);
+      }
       setChatError(error instanceof Error ? error.message : String(error));
     } finally {
       pendingRequestIdRef.current = null;
@@ -378,72 +514,50 @@ export default function App() {
     }
   };
 
+  const handleSendMessage = async (): Promise<void> => {
+    await sendPrompt(composerText, {
+      clearComposer: true,
+      restoreComposerOnError: true,
+    });
+  };
+
+  const handleRetryMessage = async (prompt: string): Promise<void> => {
+    await sendPrompt(prompt, {
+      clearComposer: false,
+      restoreComposerOnError: false,
+    });
+  };
+
+  const handleCopyMessage = async (messageId: string, text: string): Promise<void> => {
+    const didCopy = await copyTextToClipboard(text);
+    if (!didCopy) {
+      return;
+    }
+
+    setCopiedMessageId(messageId);
+    if (copyResetTimeoutRef.current !== null) {
+      window.clearTimeout(copyResetTimeoutRef.current);
+    }
+    copyResetTimeoutRef.current = window.setTimeout(() => {
+      setCopiedMessageId((current) => (current === messageId ? null : current));
+    }, 1600);
+  };
+
   return (
     <main className="shell-root">
-      <header className="topbar card">
-        <div className="topbar-section">
-          <p className="eyebrow">forjd / anvil</p>
-          <h1>Anvil</h1>
-          <p className="subtle-text">Desktop coding agent for local repositories.</p>
-        </div>
-
-        <div className="topbar-status">
-          <div className="status-cluster">
-            <span className="meta-label">Workspace</span>
-            <code className="path-chip">
-              {authOverview?.workspacePath ?? window.anvil.workspacePath}
-            </code>
-          </div>
-          <div className="status-cluster">
-            <span className="meta-label">Model</span>
-            <span
-              className={`status-pill ${connectedProvider ? 'status-pill-connected' : 'status-pill-idle'}`}
-            >
-              {connectedProvider && activeModel
-                ? `${connectedProvider.name} · ${activeModel.name}`
-                : 'Connect OpenAI Codex'}
-            </span>
-          </div>
-          <button
-            className="button button-secondary"
-            disabled={isSwitchingWorkspace}
-            onClick={() => {
-              void handleSelectWorkspace();
-            }}
-            type="button"
-          >
-            {isSwitchingWorkspace ? 'Switching…' : 'Switch repo'}
-          </button>
-        </div>
-      </header>
-
-      {lastAuthResult ? (
-        <section className={`banner ${lastAuthResult.ok ? 'banner-success' : 'banner-error'}`}>
-          <strong>{lastAuthResult.message}</strong>
-          {lastAuthResult.error ? <span>{lastAuthResult.error}</span> : null}
-        </section>
-      ) : null}
-
-      {chatError ? (
-        <section className="banner banner-error">
-          <strong>Chat error</strong>
-          <span>{chatError}</span>
-        </section>
-      ) : null}
-
       {authPrompt ? (
         <section className="modal-overlay">
-          <div className="card prompt-modal">
-            <div className="card-heading">
+          <div className="prompt-modal">
+            <div className="modal-header">
               <div>
-                <p className="eyebrow">Prompt required</p>
+                <p className="modal-kicker">Authorization required</p>
                 <h2>{authPrompt.providerId}</h2>
               </div>
             </div>
 
-            <p className="prompt-message">{authPrompt.message}</p>
+            <p className="modal-copy">{authPrompt.message}</p>
 
-            <label className="prompt-label" htmlFor="auth-prompt-input">
+            <label className="input-label" htmlFor="auth-prompt-input">
               Authorization input
             </label>
             <input
@@ -475,7 +589,7 @@ export default function App() {
                 Submit
               </button>
               <button
-                className="button button-secondary"
+                className="button button-ghost"
                 onClick={() => {
                   void handleCancelPrompt();
                 }}
@@ -488,23 +602,50 @@ export default function App() {
         </section>
       ) : null}
 
-      <section className="app-layout">
-        <aside className="sidebar card">
-          <div className="sidebar-header">
-            <div>
-              <p className="eyebrow">Sessions</p>
-              <h2>Conversations</h2>
-            </div>
-            <button
-              className="button button-secondary"
-              onClick={() => {
-                void handleCreateSession();
-              }}
-              type="button"
-            >
-              New chat
-            </button>
+      <header className="topbar">
+        <div className="brand-block">
+          <div className="brand-mark">A</div>
+          <div className="brand-copy">
+            <strong>Anvil</strong>
+            <span>Personal desktop coding agent</span>
           </div>
+        </div>
+
+        <div className="topbar-actions">
+          <span className="topbar-caption" title={workspacePath}>
+            {workspacePath}
+          </span>
+        </div>
+      </header>
+
+      {lastAuthResult ? (
+        <section className={`notice ${lastAuthResult.ok ? 'notice-success' : 'notice-error'}`}>
+          <strong>{lastAuthResult.message}</strong>
+          {lastAuthResult.error ? <span>{lastAuthResult.error}</span> : null}
+        </section>
+      ) : null}
+
+      {chatError ? (
+        <section className="notice notice-error">
+          <strong>Chat error</strong>
+          <span>{chatError}</span>
+        </section>
+      ) : null}
+
+      <section className="app-layout">
+        <aside className="sidebar">
+          <button
+            className="new-chat-button"
+            onClick={() => {
+              void handleCreateSession();
+            }}
+            type="button"
+          >
+            <span className="new-chat-plus">+</span>
+            <span>New chat</span>
+          </button>
+
+          <div className="sidebar-section-heading">Chats</div>
 
           <div className="session-list">
             {sessions.map((session) => (
@@ -514,10 +655,11 @@ export default function App() {
                 onClick={() => {
                   void loadSession(session.id);
                 }}
+                title={session.title}
                 type="button"
               >
-                <strong>{session.title}</strong>
-                <span className="subtle-text">
+                <span className="session-title">{session.title}</span>
+                <span className="session-meta">
                   {session.messageCount} messages · {formatUpdatedAt(session.updatedAt)}
                 </span>
               </button>
@@ -527,12 +669,9 @@ export default function App() {
           <details className="dev-panel">
             <summary>Developer tools</summary>
 
-            <section className="dev-section">
-              <div className="card-heading">
-                <div>
-                  <p className="eyebrow">Auth</p>
-                  <h2>Provider connections</h2>
-                </div>
+            <section className="dev-panel-section">
+              <div className="dev-panel-heading">
+                <span>Connections</span>
               </div>
 
               <div className="provider-list">
@@ -541,14 +680,14 @@ export default function App() {
 
                   return (
                     <section className="provider-card" key={provider.id}>
-                      <div className="provider-header">
+                      <div className="provider-row">
                         <div>
                           <h3>{provider.name}</h3>
-                          <p className="subtle-text">{provider.id}</p>
+                          <p className="provider-subtitle">{provider.id}</p>
                         </div>
                         <span
-                          className={`status-pill ${
-                            provider.connected ? 'status-pill-connected' : 'status-pill-idle'
+                          className={`toolbar-chip ${
+                            provider.connected ? 'toolbar-chip-success' : 'toolbar-chip-muted'
                           }`}
                         >
                           {getConnectionLabel(provider)}
@@ -575,7 +714,7 @@ export default function App() {
                           {isBusy ? 'Working…' : 'Connect'}
                         </button>
                         <button
-                          className="button button-secondary"
+                          className="button button-ghost"
                           disabled={isBusy || !provider.connected}
                           onClick={() => {
                             void handleLogout(provider.id);
@@ -591,22 +730,19 @@ export default function App() {
               </div>
             </section>
 
-            <section className="dev-section">
-              <div className="card-heading">
-                <div>
-                  <p className="eyebrow">Events</p>
-                  <h2>Auth log</h2>
-                </div>
+            <section className="dev-panel-section">
+              <div className="dev-panel-heading">
+                <span>Auth log</span>
               </div>
 
               <div className="activity-list">
-                {orderedEvents.length > 0 ? (
-                  orderedEvents.map((event, index) => (
+                {events.length > 0 ? (
+                  events.map((event, index) => (
                     <article className="activity-item" key={`${event.timestamp}-${index}`}>
                       <div className="activity-header">
                         <span className={`event-dot event-${event.level}`} />
                         <strong>{event.providerId}</strong>
-                        <span className="subtle-text">{formatTimestamp(event.timestamp)}</span>
+                        <span className="activity-time">{formatTimestamp(event.timestamp)}</span>
                       </div>
                       <p>{event.message}</p>
                       {event.url ? (
@@ -622,111 +758,189 @@ export default function App() {
                     </article>
                   ))
                 ) : (
-                  <p className="empty-state">No auth events yet.</p>
+                  <p className="empty-copy">No auth events yet.</p>
                 )}
               </div>
 
-              <code className="path-chip">
-                {authOverview?.authFilePath ?? 'Loading auth file path...'}
-              </code>
+              <div className="dev-panel-footnote">
+                <span>Auth file</span>
+                <code>{authOverview?.authFilePath ?? 'Loading auth file path...'}</code>
+              </div>
             </section>
           </details>
         </aside>
 
-        <section className="chat-pane card">
-          <div className="chat-header">
-            <div>
-              <p className="eyebrow">Conversation</p>
-              <h2>{sessionDetail?.session.title ?? 'Loading conversation...'}</h2>
+        <section className="chat-shell">
+          <header className="chat-shell-header">
+            <div className="chat-shell-heading">
+              <p className="chat-shell-kicker">Conversation</p>
+              <h1 className="chat-shell-title" title={sessionDetail?.session.title}>
+                {sessionDetail?.session.title ?? 'Loading conversation…'}
+              </h1>
+              <p className="chat-shell-subtitle">
+                {sessionDetail ? `${sessionDetail.session.messageCount} messages` : 'Loading…'}
+              </p>
             </div>
-            <span className="subtle-text">
-              {sessionDetail ? `${sessionDetail.session.messageCount} messages` : 'Loading...'}
-            </span>
-          </div>
 
-          <div className="message-thread">
-            {isBootstrapping || isLoadingSession ? (
-              <div className="empty-thread">
-                <p>Loading conversation…</p>
+            <div className="chat-context">
+              <div className="chat-context-row">
+                <span className="toolbar-chip toolbar-chip-muted" title={workspacePath}>
+                  {workspaceName}
+                </span>
+                <span
+                  className={`toolbar-chip ${
+                    connectedProvider && activeModel ? 'toolbar-chip-success' : 'toolbar-chip-muted'
+                  }`}
+                >
+                  {connectedProvider && activeModel
+                    ? `${connectedProvider.name} · ${activeModel.name}`
+                    : 'Connect OpenAI Codex'}
+                </span>
               </div>
-            ) : renderedMessages.length > 0 ? (
-              renderedMessages.map((message, index) => {
-                const roleClass =
-                  message.role === 'user'
-                    ? 'message-user'
-                    : message.role === 'assistant'
-                      ? 'message-assistant'
-                      : 'message-tool';
-                const isPending = message.id.startsWith('pending-');
-
-                return (
-                  <article className={`message-row ${roleClass}`} key={`${message.id}-${index}`}>
-                    <div className={`message-bubble ${isPending ? 'message-pending' : ''}`}>
-                      <header className="message-meta">
-                        <strong>
-                          {message.role === 'user'
-                            ? 'You'
-                            : message.role === 'assistant'
-                              ? 'Anvil'
-                              : message.toolName || 'Tool'}
-                        </strong>
-                        <span className="subtle-text">{formatTimestamp(message.timestamp)}</span>
-                      </header>
-                      <p>{messageBody(message)}</p>
-                      {message.stopReason ? (
-                        <span className="message-stop-reason">{message.stopReason}</span>
-                      ) : null}
-                    </div>
-                  </article>
-                );
-              })
-            ) : (
-              <div className="empty-thread">
-                <p>No messages yet. Start the conversation below.</p>
-              </div>
-            )}
-          </div>
-
-          <div className="composer">
-            <textarea
-              className="text-area composer-input"
-              disabled={!connectedProvider || !activeModel || !activeSessionId || isSendingMessage}
-              placeholder={
-                connectedProvider && activeModel
-                  ? 'Ask Anvil to inspect the repo, explain code, or plan a change…'
-                  : 'Connect OpenAI Codex in Developer tools to start chatting.'
-              }
-              value={composerText}
-              onChange={(event) => {
-                setComposerText(event.target.value);
-              }}
-              onKeyDown={(event) => {
-                if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-                  event.preventDefault();
-                  void handleSendMessage();
-                }
-              }}
-            />
-            <div className="composer-footer">
-              <span className="subtle-text">⌘/Ctrl + Enter to send</span>
               <button
-                className="button button-primary"
-                disabled={
-                  !connectedProvider ||
-                  !activeModel ||
-                  !activeSessionId ||
-                  composerText.trim().length === 0 ||
-                  isSendingMessage
-                }
+                className="button button-ghost button-compact"
+                disabled={isSwitchingWorkspace}
                 onClick={() => {
-                  void handleSendMessage();
+                  void handleSelectWorkspace();
                 }}
                 type="button"
               >
-                {isSendingMessage ? 'Sending…' : 'Send'}
+                {isSwitchingWorkspace ? 'Switching…' : 'Switch repo'}
               </button>
             </div>
+          </header>
+
+          <div className="message-thread" onScroll={handleThreadScroll} ref={threadRef}>
+            <div className="thread-stack">
+              {isBootstrapping || isLoadingSession ? (
+                <div className="empty-thread">
+                  <p>Loading conversation…</p>
+                </div>
+              ) : renderedMessages.length > 0 ? (
+                renderedMessages.map((message, index) => {
+                  const roleClass =
+                    message.role === 'user'
+                      ? 'message-user'
+                      : message.role === 'assistant'
+                        ? 'message-assistant'
+                        : 'message-tool';
+                  const isPending = message.id.startsWith('pending-');
+                  const body = messageBody(message);
+                  const isErrorMessage = message.isError || message.stopReason === 'error';
+                  const retryPrompt = findRetryPrompt(renderedMessages, index);
+                  const canRetry =
+                    Boolean(retryPrompt && connectedProvider && activeModel && activeSessionId) &&
+                    !isPending &&
+                    !isSendingMessage;
+                  const canCopy = body.trim().length > 0 && !isPending;
+                  const bubbleClassName = [
+                    'message-bubble',
+                    isPending ? 'message-pending' : '',
+                    isErrorMessage ? 'message-error' : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' ');
+
+                  return (
+                    <article className={`message-row ${roleClass}`} key={`${message.id}-${index}`}>
+                      <div className={`message-avatar ${roleClass}`}>{messageAvatar(message)}</div>
+                      <div className={bubbleClassName}>
+                        <header className="message-meta">
+                          <strong>{messageLabel(message)}</strong>
+                          <div className="message-meta-actions">
+                            <span className="message-time">
+                              {formatTimestamp(message.timestamp)}
+                            </span>
+                            {message.role !== 'user' ? (
+                              <>
+                                <button
+                                  className={`message-utility-button ${
+                                    copiedMessageId === message.id
+                                      ? 'message-utility-button-active'
+                                      : ''
+                                  }`}
+                                  disabled={!canCopy}
+                                  onClick={() => {
+                                    void handleCopyMessage(message.id, body);
+                                  }}
+                                  type="button"
+                                >
+                                  {copiedMessageId === message.id ? 'Copied' : 'Copy'}
+                                </button>
+                                {retryPrompt ? (
+                                  <button
+                                    className="message-utility-button"
+                                    disabled={!canRetry}
+                                    onClick={() => {
+                                      void handleRetryMessage(retryPrompt);
+                                    }}
+                                    type="button"
+                                  >
+                                    Retry
+                                  </button>
+                                ) : null}
+                              </>
+                            ) : null}
+                          </div>
+                        </header>
+                        <p className="message-content">{body}</p>
+                        {message.stopReason ? (
+                          <span className="message-stop-reason">{message.stopReason}</span>
+                        ) : null}
+                      </div>
+                    </article>
+                  );
+                })
+              ) : (
+                <div className="empty-thread empty-thread-large">
+                  <div>
+                    <h2>How can I help?</h2>
+                    <p>Ask Anvil to inspect the repo, explain code, or plan a change.</p>
+                  </div>
+                </div>
+              )}
+              <div className="thread-endcap" ref={threadEndRef} />
+            </div>
           </div>
+
+          <footer className="composer-shell">
+            <div className="composer-surface">
+              <textarea
+                className="composer-input"
+                disabled={!canChat || isSendingMessage}
+                placeholder={
+                  connectedProvider && activeModel
+                    ? 'Message Anvil…'
+                    : 'Connect OpenAI Codex in Developer tools to start chatting.'
+                }
+                ref={composerRef}
+                rows={1}
+                value={composerText}
+                onChange={(event) => {
+                  setComposerText(event.target.value);
+                }}
+                onKeyDown={(event) => {
+                  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                    event.preventDefault();
+                    void handleSendMessage();
+                  }
+                }}
+              />
+              <div className="composer-toolbar">
+                <span className="composer-hint">⌘/Ctrl + Enter to send</span>
+                <button
+                  className="button button-primary composer-send"
+                  disabled={!canChat || composerText.trim().length === 0 || isSendingMessage}
+                  onClick={() => {
+                    void handleSendMessage();
+                  }}
+                  type="button"
+                >
+                  {isSendingMessage ? 'Sending…' : 'Send'}
+                </button>
+              </div>
+            </div>
+          </footer>
         </section>
       </section>
     </main>
