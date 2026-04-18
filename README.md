@@ -29,6 +29,7 @@ This repo is at the initial scaffold stage. The current focus is:
 .
 ├── .github/workflows/     # CI, release, and PR title checks
 ├── docs/plans/            # Product and architecture planning docs
+├── src/harness/           # Agent runtime + provider/tool/session scaffold
 ├── src/main/              # Electron main process
 ├── src/preload/           # Electron preload bridge
 ├── src/renderer/          # React renderer app
