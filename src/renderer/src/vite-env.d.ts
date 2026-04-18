@@ -1,12 +1,11 @@
 /// <reference types="vite/client" />
 
-interface Window {
-  anvil: {
-    platform: NodeJS.Platform;
-    versions: {
-      chrome: string;
-      electron: string;
-      node: string;
-    };
-  };
+import type { AnvilBridge } from '../../shared/anvil-api';
+
+declare global {
+  interface Window {
+    anvil: AnvilBridge;
+  }
 }
+
+export {};
