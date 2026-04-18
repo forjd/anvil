@@ -27,10 +27,14 @@ export interface OpenAICodexRequestBody {
   store: false;
   instructions: string;
   input: OpenAICodexInputItem[];
-  tool_choice: 'auto';
-  parallel_tool_calls: true;
+  tools?: Array<Record<string, unknown>>;
+  tool_choice?: 'auto';
+  parallel_tool_calls?: true;
   max_output_tokens?: number;
   temperature?: number;
+  text?: {
+    verbosity: 'low' | 'medium' | 'high';
+  };
 }
 
 const mapUserMessage = (message: UserMessage): OpenAICodexInputItem => ({
@@ -95,14 +99,30 @@ export const buildOpenAICodexRequestBody = (
   model: ModelSpec,
   context: AgentContext,
   options: StreamOptions,
-): OpenAICodexRequestBody => ({
-  model: model.id,
-  stream: true,
-  store: false,
-  instructions: context.systemPrompt,
-  input: context.messages.map(mapMessageToOpenAICodexInput),
-  tool_choice: 'auto',
-  parallel_tool_calls: true,
-  max_output_tokens: options.maxTokens,
-  temperature: options.temperature,
-});
+): OpenAICodexRequestBody => {
+  const body: OpenAICodexRequestBody = {
+    model: model.id,
+    stream: true,
+    store: false,
+    instructions: context.systemPrompt,
+    input: context.messages.map(mapMessageToOpenAICodexInput),
+    max_output_tokens: options.maxTokens,
+    temperature: options.temperature,
+    text: {
+      verbosity: 'medium',
+    },
+  };
+
+  if (context.tools.length > 0) {
+    body.tools = context.tools.map((tool) => ({
+      type: 'function',
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.inputSchema,
+    }));
+    body.tool_choice = 'auto';
+    body.parallel_tool_calls = true;
+  }
+
+  return body;
+};

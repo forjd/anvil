@@ -14,6 +14,7 @@ import {
 import {
   createHarnessRuntime,
   getHarnessPaths,
+  runTextPrompt,
   type AuthRecord,
   type OAuthLoginCallbacks,
 } from '../harness';
@@ -23,6 +24,8 @@ import {
   type AuthOverview,
   type AuthProgressEvent,
   type AuthPromptRequest,
+  type PromptRunRequest,
+  type PromptRunResult,
 } from '../shared/anvil-api';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -47,7 +50,7 @@ const pendingAuthPrompts = new Map<string, PendingAuthPrompt>();
 let mainWindow: BrowserWindow | null = null;
 
 const createWindow = (): void => {
-  mainWindow = new BrowserWindow({
+  const windowInstance = new BrowserWindow({
     width: 1440,
     height: 900,
     minWidth: 1120,
@@ -61,22 +64,30 @@ const createWindow = (): void => {
       sandbox: false,
     },
   });
+  const webContentsId = windowInstance.webContents.id;
 
-  mainWindow.on('closed', () => {
-    if (mainWindow) {
-      rejectPromptsForWebContents(mainWindow.webContents.id, 'The window was closed.');
+  mainWindow = windowInstance;
+
+  windowInstance.on('closed', () => {
+    rejectPromptsForWebContents(webContentsId, 'The window was closed.');
+
+    if (mainWindow === windowInstance) {
+      mainWindow = null;
     }
-    mainWindow = null;
   });
 
   if (process.env.ELECTRON_RENDERER_URL) {
-    void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
+    void windowInstance.loadURL(process.env.ELECTRON_RENDERER_URL);
   } else {
-    void mainWindow.loadFile(join(__dirname, '../renderer/index.html'));
+    void windowInstance.loadFile(join(__dirname, '../renderer/index.html'));
   }
 };
 
 const emitAuthProgress = (webContents: WebContents, event: AuthProgressEvent): void => {
+  if (webContents.isDestroyed()) {
+    return;
+  }
+
   webContents.send(ANVIL_IPC_CHANNELS.authProgress, event);
 };
 
@@ -261,6 +272,31 @@ ipcMain.handle(
       true,
       provider ? `Removed local credentials for ${provider.name}.` : 'Removed local credentials.',
     );
+  },
+);
+
+ipcMain.handle(
+  ANVIL_IPC_CHANNELS.promptRun,
+  async (_event: IpcMainInvokeEvent, request: PromptRunRequest): Promise<PromptRunResult> => {
+    try {
+      const result = await runTextPrompt(runtime, request);
+      return {
+        modelId: request.modelId,
+        ok: true,
+        prompt: request.prompt,
+        providerId: request.providerId,
+        responseText: result.responseText,
+        stopReason: result.assistant.stopReason,
+      };
+    } catch (error) {
+      return {
+        error: error instanceof Error ? error.message : String(error),
+        modelId: request.modelId,
+        ok: false,
+        prompt: request.prompt,
+        providerId: request.providerId,
+      };
+    }
   },
 );
 

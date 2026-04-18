@@ -6,6 +6,7 @@ export const ANVIL_IPC_CHANNELS = {
   authProgress: 'anvil:auth:progress',
   authPrompt: 'anvil:auth:prompt',
   authSubmitPrompt: 'anvil:auth:submit-prompt',
+  promptRun: 'anvil:prompt:run',
 } as const;
 
 export type AuthConnectionKind = 'api_key' | 'none' | 'oauth';
@@ -63,6 +64,22 @@ export interface AuthPromptRequest {
   secret?: boolean;
 }
 
+export interface PromptRunRequest {
+  modelId: string;
+  prompt: string;
+  providerId: string;
+}
+
+export interface PromptRunResult {
+  error?: string;
+  modelId: string;
+  ok: boolean;
+  prompt: string;
+  providerId: string;
+  responseText?: string;
+  stopReason?: 'aborted' | 'error' | 'length' | 'stop' | 'toolUse';
+}
+
 export interface AnvilBridge extends RuntimeSummary {
   cancelAuthPrompt(requestId: string): Promise<void>;
   getAuthOverview(): Promise<AuthOverview>;
@@ -70,5 +87,6 @@ export interface AnvilBridge extends RuntimeSummary {
   logout(providerId: string): Promise<AuthActionResult>;
   onAuthProgress(listener: (event: AuthProgressEvent) => void): () => void;
   onAuthPrompt(listener: (prompt: AuthPromptRequest) => void): () => void;
+  runPrompt(request: PromptRunRequest): Promise<PromptRunResult>;
   submitAuthPrompt(requestId: string, value: string): Promise<void>;
 }

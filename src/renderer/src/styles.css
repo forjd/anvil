@@ -131,8 +131,17 @@ code {
   margin-top: 24px;
 }
 
+.playground-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 24px;
+  margin-top: 24px;
+}
+
 .providers-card,
 .activity-card,
+.prompt-run-card,
+.prompt-response-card,
 .footer-card {
   display: grid;
   gap: 20px;
@@ -265,17 +274,28 @@ code {
   color: #98a2ff;
 }
 
-.text-input {
+.text-input,
+.text-area {
   width: 100%;
-  min-height: 46px;
-  padding: 0 14px;
   border-radius: 14px;
   border: 1px solid rgba(140, 158, 255, 0.22);
   background: rgba(7, 10, 16, 0.84);
   color: #f5f7ff;
 }
 
-.text-input:focus {
+.text-input {
+  min-height: 46px;
+  padding: 0 14px;
+}
+
+.text-area {
+  min-height: 180px;
+  padding: 14px;
+  resize: vertical;
+}
+
+.text-input:focus,
+.text-area:focus {
   outline: 2px solid rgba(124, 136, 255, 0.55);
   outline-offset: 2px;
 }
@@ -312,6 +332,30 @@ code {
 
 .inline-link:hover {
   text-decoration: underline;
+}
+
+.response-output {
+  margin: 0;
+  padding: 18px;
+  border-radius: 18px;
+  background: rgba(9, 12, 17, 0.62);
+  border: 1px solid rgba(140, 158, 255, 0.1);
+  color: #e8ecff;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.response-error {
+  display: grid;
+  gap: 8px;
+  padding: 18px;
+  border-radius: 18px;
+  background: rgba(127, 29, 29, 0.28);
+  border: 1px solid rgba(239, 68, 68, 0.22);
+}
+
+.response-error p {
+  color: #fecaca;
 }
 
 .footer-card {
@@ -357,6 +401,7 @@ strong {
 @media (max-width: 980px) {
   .hero,
   .auth-grid,
+  .playground-grid,
   .footer-card {
     grid-template-columns: 1fr;
   }

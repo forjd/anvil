@@ -6,6 +6,7 @@ import type {
   AuthProgressEvent,
   AuthPromptRequest,
   AuthProviderSummary,
+  PromptRunResult,
 } from '../../shared/anvil-api';
 
 const formatTimestamp = (timestamp: number): string =>
@@ -38,6 +39,11 @@ export default function App() {
   const [busyProviderId, setBusyProviderId] = useState<string | null>(null);
   const [events, setEvents] = useState<AuthProgressEvent[]>([]);
   const [lastResult, setLastResult] = useState<AuthActionResult | null>(null);
+  const [promptInput, setPromptInput] = useState(
+    'Give me a short hello from Codex through Anvil and confirm the auth path is working.',
+  );
+  const [promptResult, setPromptResult] = useState<PromptRunResult | null>(null);
+  const [runningPrompt, setRunningPrompt] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -68,6 +74,14 @@ export default function App() {
   }, []);
 
   const orderedEvents = useMemo(() => events, [events]);
+  const connectedProvider = useMemo(
+    () =>
+      authOverview?.providers.find(
+        (provider) => provider.connected && provider.models.length > 0,
+      ) ?? null,
+    [authOverview],
+  );
+  const activeModel = connectedProvider?.models[0] ?? null;
 
   const handleLogin = async (providerId: string): Promise<void> => {
     setBusyProviderId(providerId);
@@ -117,6 +131,26 @@ export default function App() {
     await window.anvil.cancelAuthPrompt(authPrompt.requestId);
     setAuthPrompt(null);
     setAuthPromptValue('');
+  };
+
+  const handleRunPrompt = async (): Promise<void> => {
+    if (!connectedProvider || !activeModel || promptInput.trim().length === 0) {
+      return;
+    }
+
+    setRunningPrompt(true);
+    setPromptResult(null);
+
+    try {
+      const result = await window.anvil.runPrompt({
+        modelId: activeModel.id,
+        prompt: promptInput,
+        providerId: connectedProvider.id,
+      });
+      setPromptResult(result);
+    } finally {
+      setRunningPrompt(false);
+    }
   };
 
   return (
@@ -321,13 +355,95 @@ export default function App() {
         </article>
       </section>
 
+      <section className="grid playground-grid">
+        <article className="card prompt-run-card">
+          <div className="card-heading">
+            <div>
+              <p className="eyebrow">Prompt test</p>
+              <h2>First authenticated model call</h2>
+            </div>
+            <span className="subtle-text">
+              {connectedProvider && activeModel
+                ? `${connectedProvider.name} / ${activeModel.name}`
+                : 'Connect a provider to enable prompt testing'}
+            </span>
+          </div>
+
+          <p className="subtle-text">
+            This uses the first connected provider and its first model. It sends one prompt through
+            the harness transport without any tool execution yet.
+          </p>
+
+          <label className="prompt-label" htmlFor="prompt-run-input">
+            Prompt
+          </label>
+          <textarea
+            id="prompt-run-input"
+            className="text-area"
+            disabled={!connectedProvider || runningPrompt}
+            value={promptInput}
+            onChange={(event) => {
+              setPromptInput(event.target.value);
+            }}
+          />
+
+          <div className="button-row">
+            <button
+              className="button button-primary"
+              disabled={
+                !connectedProvider ||
+                !activeModel ||
+                promptInput.trim().length === 0 ||
+                runningPrompt
+              }
+              onClick={() => {
+                void handleRunPrompt();
+              }}
+              type="button"
+            >
+              {runningPrompt ? 'Running…' : 'Run prompt'}
+            </button>
+          </div>
+        </article>
+
+        <article className="card prompt-response-card">
+          <div className="card-heading">
+            <div>
+              <p className="eyebrow">Response</p>
+              <h2>Model output</h2>
+            </div>
+            {promptResult?.stopReason ? (
+              <span className="status-pill status-pill-idle">{promptResult.stopReason}</span>
+            ) : null}
+          </div>
+
+          {promptResult ? (
+            promptResult.ok ? (
+              <pre className="response-output">
+                {promptResult.responseText || '(empty response)'}
+              </pre>
+            ) : (
+              <div className="response-error">
+                <strong>Prompt failed</strong>
+                <p>{promptResult.error}</p>
+              </div>
+            )
+          ) : (
+            <p className="empty-state">
+              No model response yet. Connect OpenAI Codex, then run the test prompt.
+            </p>
+          )}
+        </article>
+      </section>
+
       <section className="card footer-card">
         <div>
           <p className="eyebrow">Storage</p>
           <h2>Local auth state</h2>
           <p className="subtle-text">
             Credentials are stored locally on disk. Right now the frontend is just enough to inspect
-            providers, kick off login attempts, and handle prompt handoffs.
+            providers, kick off login attempts, handle prompt handoffs, and verify the first model
+            call end to end.
           </p>
         </div>
         <code className="path-chip">

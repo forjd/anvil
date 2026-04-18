@@ -5,6 +5,7 @@ import {
   type AnvilBridge,
   type AuthProgressEvent,
   type AuthPromptRequest,
+  type PromptRunResult,
 } from '../shared/anvil-api';
 
 const anvilBridge: AnvilBridge = {
@@ -51,6 +52,9 @@ const anvilBridge: AnvilBridge = {
     return () => {
       ipcRenderer.removeListener(ANVIL_IPC_CHANNELS.authPrompt, wrapped);
     };
+  },
+  runPrompt(request) {
+    return ipcRenderer.invoke(ANVIL_IPC_CHANNELS.promptRun, request) as Promise<PromptRunResult>;
   },
   submitAuthPrompt(requestId, value) {
     return ipcRenderer.invoke(
