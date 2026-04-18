@@ -12,9 +12,13 @@ import {
 } from 'electron';
 
 import {
+  createConversationSession,
   createHarnessRuntime,
   getHarnessPaths,
+  listConversationSessions,
+  loadConversationSession,
   runTextPrompt,
+  sendConversationMessage,
   type AuthRecord,
   type OAuthLoginCallbacks,
 } from '../harness';
@@ -24,12 +28,18 @@ import {
   type AuthOverview,
   type AuthProgressEvent,
   type AuthPromptRequest,
+  type CreateSessionResult,
   type PromptRunRequest,
   type PromptRunResult,
+  type SendMessageRequest,
+  type SendMessageResult,
+  type SessionDetail,
+  type SessionSummary,
 } from '../shared/anvil-api';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const runtime = createHarnessRuntime();
+const workspacePath = process.cwd();
 
 const runtimeSummary = {
   platform: process.platform,
@@ -38,6 +48,7 @@ const runtimeSummary = {
     electron: process.versions.electron,
     node: process.versions.node,
   },
+  workspacePath,
 } as const;
 
 interface PendingAuthPrompt {
@@ -201,6 +212,42 @@ const createLoginCallbacks = (
 });
 
 ipcMain.handle(ANVIL_IPC_CHANNELS.authGetOverview, async () => createAuthOverview());
+
+ipcMain.handle(
+  ANVIL_IPC_CHANNELS.chatListSessions,
+  async (): Promise<SessionSummary[]> => listConversationSessions(runtime, workspacePath),
+);
+
+ipcMain.handle(
+  ANVIL_IPC_CHANNELS.chatCreateSession,
+  async (): Promise<CreateSessionResult> => ({
+    detail: await createConversationSession(runtime, workspacePath),
+  }),
+);
+
+ipcMain.handle(
+  ANVIL_IPC_CHANNELS.chatLoadSession,
+  async (_event: IpcMainInvokeEvent, sessionId: string): Promise<SessionDetail> =>
+    loadConversationSession(runtime, sessionId),
+);
+
+ipcMain.handle(
+  ANVIL_IPC_CHANNELS.chatSendMessage,
+  async (_event: IpcMainInvokeEvent, request: SendMessageRequest): Promise<SendMessageResult> => {
+    try {
+      const detail = await sendConversationMessage(runtime, request);
+      return {
+        detail,
+        ok: true,
+      };
+    } catch (error) {
+      return {
+        error: error instanceof Error ? error.message : String(error),
+        ok: false,
+      };
+    }
+  },
+);
 
 ipcMain.handle(
   ANVIL_IPC_CHANNELS.authLogin,

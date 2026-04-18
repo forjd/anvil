@@ -13,6 +13,7 @@ export * from './agent/loop';
 export * from './auth/types';
 export * from './auth/storage';
 export * from './auth/manager';
+export * from './conversation';
 
 export * from './providers';
 export * from './providers/openai-codex';

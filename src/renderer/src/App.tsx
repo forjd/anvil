@@ -6,15 +6,37 @@ import type {
   AuthProgressEvent,
   AuthPromptRequest,
   AuthProviderSummary,
-  PromptRunResult,
+  ConversationMessage,
+  SessionDetail,
+  SessionSummary,
 } from '../../shared/anvil-api';
 
 const formatTimestamp = (timestamp: number): string =>
   new Intl.DateTimeFormat(undefined, {
     hour: 'numeric',
     minute: '2-digit',
-    second: '2-digit',
   }).format(timestamp);
+
+const formatUpdatedAt = (timestamp: number): string => {
+  const delta = Date.now() - timestamp;
+  const minutes = Math.floor(delta / 60_000);
+
+  if (minutes < 1) {
+    return 'just now';
+  }
+
+  if (minutes < 60) {
+    return `${minutes}m ago`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours}h ago`;
+  }
+
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+};
 
 const getConnectionLabel = (provider: AuthProviderSummary): string => {
   if (!provider.connected) {
@@ -32,30 +54,93 @@ const getConnectionLabel = (provider: AuthProviderSummary): string => {
   return 'Connected';
 };
 
+const upsertSession = (
+  sessions: SessionSummary[],
+  nextSession: SessionSummary,
+): SessionSummary[] => {
+  const remaining = sessions.filter((session) => session.id !== nextSession.id);
+  return [nextSession, ...remaining].sort((a, b) => b.updatedAt - a.updatedAt);
+};
+
+const messageBody = (message: ConversationMessage): string => {
+  if (message.text.trim().length > 0) {
+    return message.text;
+  }
+
+  if (message.role === 'assistant' && message.stopReason === 'error') {
+    return '(assistant returned an error)';
+  }
+
+  return '(empty message)';
+};
+
 export default function App() {
   const [authOverview, setAuthOverview] = useState<AuthOverview | null>(null);
   const [authPrompt, setAuthPrompt] = useState<AuthPromptRequest | null>(null);
   const [authPromptValue, setAuthPromptValue] = useState('');
   const [busyProviderId, setBusyProviderId] = useState<string | null>(null);
   const [events, setEvents] = useState<AuthProgressEvent[]>([]);
-  const [lastResult, setLastResult] = useState<AuthActionResult | null>(null);
-  const [promptInput, setPromptInput] = useState(
-    'Give me a short hello from Codex through Anvil and confirm the auth path is working.',
+  const [lastAuthResult, setLastAuthResult] = useState<AuthActionResult | null>(null);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null);
+  const [composerText, setComposerText] = useState('');
+  const [pendingPrompt, setPendingPrompt] = useState<{ text: string; timestamp: number } | null>(
+    null,
   );
-  const [promptResult, setPromptResult] = useState<PromptRunResult | null>(null);
-  const [runningPrompt, setRunningPrompt] = useState(false);
+  const [isSendingMessage, setIsSendingMessage] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [isBootstrapping, setIsBootstrapping] = useState(true);
+  const [isLoadingSession, setIsLoadingSession] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
 
-    const loadOverview = async (): Promise<void> => {
-      const overview = await window.anvil.getAuthOverview();
-      if (!cancelled) {
+    const bootstrap = async (): Promise<void> => {
+      try {
+        const [overview, existingSessions] = await Promise.all([
+          window.anvil.getAuthOverview(),
+          window.anvil.listSessions(),
+        ]);
+
+        if (cancelled) {
+          return;
+        }
+
         setAuthOverview(overview);
+        setSessions(existingSessions);
+
+        const firstExistingSession = existingSessions[0];
+        if (firstExistingSession) {
+          const firstSession = await window.anvil.loadSession(firstExistingSession.id);
+          if (cancelled) {
+            return;
+          }
+
+          setActiveSessionId(firstSession.session.id);
+          setSessionDetail(firstSession);
+        } else {
+          const created = await window.anvil.createSession();
+          if (cancelled) {
+            return;
+          }
+
+          setSessions([created.detail.session]);
+          setActiveSessionId(created.detail.session.id);
+          setSessionDetail(created.detail);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setChatError(error instanceof Error ? error.message : String(error));
+        }
+      } finally {
+        if (!cancelled) {
+          setIsBootstrapping(false);
+        }
       }
     };
 
-    void loadOverview();
+    void bootstrap();
 
     const offProgress = window.anvil.onAuthProgress((event) => {
       setEvents((current) => [event, ...current].slice(0, 20));
@@ -73,7 +158,6 @@ export default function App() {
     };
   }, []);
 
-  const orderedEvents = useMemo(() => events, [events]);
   const connectedProvider = useMemo(
     () =>
       authOverview?.providers.find(
@@ -82,14 +166,67 @@ export default function App() {
     [authOverview],
   );
   const activeModel = connectedProvider?.models[0] ?? null;
+  const orderedEvents = useMemo(() => events, [events]);
+  const renderedMessages = useMemo(() => {
+    const baseMessages = sessionDetail?.messages ?? [];
+    if (!pendingPrompt) {
+      return baseMessages;
+    }
+
+    return [
+      ...baseMessages,
+      {
+        id: 'pending-user',
+        role: 'user' as const,
+        text: pendingPrompt.text,
+        timestamp: pendingPrompt.timestamp,
+      },
+      {
+        id: 'pending-assistant',
+        role: 'assistant' as const,
+        stopReason: 'stop' as const,
+        text: 'Thinking…',
+        timestamp: pendingPrompt.timestamp,
+      },
+    ];
+  }, [pendingPrompt, sessionDetail]);
+
+  const loadSession = async (sessionId: string): Promise<void> => {
+    setIsLoadingSession(true);
+    setChatError(null);
+
+    try {
+      const detail = await window.anvil.loadSession(sessionId);
+      setActiveSessionId(detail.session.id);
+      setSessionDetail(detail);
+      setSessions((current) => upsertSession(current, detail.session));
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsLoadingSession(false);
+    }
+  };
+
+  const handleCreateSession = async (): Promise<void> => {
+    setChatError(null);
+
+    try {
+      const created = await window.anvil.createSession();
+      setActiveSessionId(created.detail.session.id);
+      setSessionDetail(created.detail);
+      setSessions((current) => upsertSession(current, created.detail.session));
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : String(error));
+    }
+  };
 
   const handleLogin = async (providerId: string): Promise<void> => {
     setBusyProviderId(providerId);
-    setLastResult(null);
+    setLastAuthResult(null);
 
     try {
       const result = await window.anvil.login(providerId);
-      setLastResult(result);
+      setLastAuthResult(result);
       setAuthOverview(result.overview);
     } finally {
       setAuthPrompt(null);
@@ -100,11 +237,11 @@ export default function App() {
 
   const handleLogout = async (providerId: string): Promise<void> => {
     setBusyProviderId(providerId);
-    setLastResult(null);
+    setLastAuthResult(null);
 
     try {
       const result = await window.anvil.logout(providerId);
-      setLastResult(result);
+      setLastAuthResult(result);
       setAuthOverview(result.overview);
     } finally {
       setAuthPrompt(null);
@@ -133,322 +270,387 @@ export default function App() {
     setAuthPromptValue('');
   };
 
-  const handleRunPrompt = async (): Promise<void> => {
-    if (!connectedProvider || !activeModel || promptInput.trim().length === 0) {
+  const handleSendMessage = async (): Promise<void> => {
+    if (
+      !connectedProvider ||
+      !activeModel ||
+      !activeSessionId ||
+      composerText.trim().length === 0 ||
+      isSendingMessage
+    ) {
       return;
     }
 
-    setRunningPrompt(true);
-    setPromptResult(null);
+    const prompt = composerText.trim();
+    setComposerText('');
+    setPendingPrompt({ text: prompt, timestamp: Date.now() });
+    setIsSendingMessage(true);
+    setChatError(null);
 
     try {
-      const result = await window.anvil.runPrompt({
+      const result = await window.anvil.sendMessage({
         modelId: activeModel.id,
-        prompt: promptInput,
+        prompt,
         providerId: connectedProvider.id,
+        sessionId: activeSessionId,
       });
-      setPromptResult(result);
+
+      if (!result.ok || !result.detail) {
+        throw new Error(result.error || 'Message send failed.');
+      }
+
+      setSessionDetail(result.detail);
+      setSessions((current) => upsertSession(current, result.detail!.session));
+      setActiveSessionId(result.detail.session.id);
+    } catch (error) {
+      setComposerText(prompt);
+      setChatError(error instanceof Error ? error.message : String(error));
     } finally {
-      setRunningPrompt(false);
+      setPendingPrompt(null);
+      setIsSendingMessage(false);
     }
   };
 
   return (
-    <main className="app-shell">
-      <section className="hero card">
-        <div className="hero-copy">
+    <main className="shell-root">
+      <header className="topbar card">
+        <div className="topbar-section">
           <p className="eyebrow">forjd / anvil</p>
-          <h1>Auth workbench</h1>
-          <p className="lead">
-            A minimal frontend for iterating on the local OAuth flow before the full coding-agent UI
-            exists.
-          </p>
+          <h1>Anvil</h1>
+          <p className="subtle-text">Desktop coding agent for local repositories.</p>
         </div>
 
-        <div className="hero-meta">
-          <div>
-            <span className="meta-label">Platform</span>
-            <strong>{window.anvil.platform}</strong>
+        <div className="topbar-status">
+          <div className="status-cluster">
+            <span className="meta-label">Workspace</span>
+            <code className="path-chip">
+              {authOverview?.workspacePath ?? window.anvil.workspacePath}
+            </code>
           </div>
-          <div>
-            <span className="meta-label">Electron</span>
-            <strong>{window.anvil.versions.electron}</strong>
-          </div>
-          <div>
-            <span className="meta-label">Node</span>
-            <strong>{window.anvil.versions.node}</strong>
+          <div className="status-cluster">
+            <span className="meta-label">Model</span>
+            <span
+              className={`status-pill ${connectedProvider ? 'status-pill-connected' : 'status-pill-idle'}`}
+            >
+              {connectedProvider && activeModel
+                ? `${connectedProvider.name} · ${activeModel.name}`
+                : 'Connect OpenAI Codex'}
+            </span>
           </div>
         </div>
-      </section>
+      </header>
 
-      {lastResult ? (
-        <section className={`banner ${lastResult.ok ? 'banner-success' : 'banner-error'}`}>
-          <strong>{lastResult.message}</strong>
-          {lastResult.error ? <span>{lastResult.error}</span> : null}
+      {lastAuthResult ? (
+        <section className={`banner ${lastAuthResult.ok ? 'banner-success' : 'banner-error'}`}>
+          <strong>{lastAuthResult.message}</strong>
+          {lastAuthResult.error ? <span>{lastAuthResult.error}</span> : null}
+        </section>
+      ) : null}
+
+      {chatError ? (
+        <section className="banner banner-error">
+          <strong>Chat error</strong>
+          <span>{chatError}</span>
         </section>
       ) : null}
 
       {authPrompt ? (
-        <section className="card prompt-card">
-          <div className="card-heading">
-            <div>
-              <p className="eyebrow">Prompt required</p>
-              <h2>{authPrompt.providerId}</h2>
+        <section className="modal-overlay">
+          <div className="card prompt-modal">
+            <div className="card-heading">
+              <div>
+                <p className="eyebrow">Prompt required</p>
+                <h2>{authPrompt.providerId}</h2>
+              </div>
             </div>
-          </div>
 
-          <p className="prompt-message">{authPrompt.message}</p>
+            <p className="prompt-message">{authPrompt.message}</p>
 
-          <label className="prompt-label" htmlFor="auth-prompt-input">
-            Authorization input
-          </label>
-          <input
-            id="auth-prompt-input"
-            className="text-input"
-            type="text"
-            placeholder="Paste code or redirect URL"
-            value={authPromptValue}
-            onChange={(event) => {
-              setAuthPromptValue(event.target.value);
-            }}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' && authPromptValue.trim().length > 0) {
-                event.preventDefault();
-                void handleSubmitPrompt();
-              }
-            }}
-          />
-
-          <div className="button-row">
-            <button
-              className="button button-primary"
-              disabled={authPromptValue.trim().length === 0}
-              onClick={() => {
-                void handleSubmitPrompt();
+            <label className="prompt-label" htmlFor="auth-prompt-input">
+              Authorization input
+            </label>
+            <input
+              id="auth-prompt-input"
+              className="text-input"
+              type="text"
+              placeholder="Paste code or redirect URL"
+              value={authPromptValue}
+              onChange={(event) => {
+                setAuthPromptValue(event.target.value);
               }}
-              type="button"
-            >
-              Submit
-            </button>
-            <button
-              className="button button-secondary"
-              onClick={() => {
-                void handleCancelPrompt();
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && authPromptValue.trim().length > 0) {
+                  event.preventDefault();
+                  void handleSubmitPrompt();
+                }
               }}
-              type="button"
-            >
-              Cancel
-            </button>
+            />
+
+            <div className="button-row">
+              <button
+                className="button button-primary"
+                disabled={authPromptValue.trim().length === 0}
+                onClick={() => {
+                  void handleSubmitPrompt();
+                }}
+                type="button"
+              >
+                Submit
+              </button>
+              <button
+                className="button button-secondary"
+                onClick={() => {
+                  void handleCancelPrompt();
+                }}
+                type="button"
+              >
+                Cancel
+              </button>
+            </div>
           </div>
         </section>
       ) : null}
 
-      <section className="grid auth-grid">
-        <article className="card providers-card">
-          <div className="card-heading">
+      <section className="app-layout">
+        <aside className="sidebar card">
+          <div className="sidebar-header">
             <div>
-              <p className="eyebrow">Providers</p>
-              <h2>Available auth targets</h2>
+              <p className="eyebrow">Sessions</p>
+              <h2>Conversations</h2>
             </div>
-            <span className="subtle-text">
-              {authOverview ? `${authOverview.providers.length} configured provider` : 'Loading...'}
-              {authOverview?.providers.length === 1 ? '' : 's'}
-            </span>
-          </div>
-
-          <div className="provider-list">
-            {authOverview?.providers.map((provider) => {
-              const isBusy = busyProviderId === provider.id;
-
-              return (
-                <section className="provider-card" key={provider.id}>
-                  <div className="provider-header">
-                    <div>
-                      <h3>{provider.name}</h3>
-                      <p className="subtle-text">{provider.id}</p>
-                    </div>
-                    <span
-                      className={`status-pill ${
-                        provider.connected ? 'status-pill-connected' : 'status-pill-idle'
-                      }`}
-                    >
-                      {getConnectionLabel(provider)}
-                    </span>
-                  </div>
-
-                  <div className="provider-meta">
-                    <div>
-                      <span className="meta-label">Auth</span>
-                      <strong>{provider.hasOAuth ? 'OAuth available' : 'No OAuth flow'}</strong>
-                    </div>
-                    <div>
-                      <span className="meta-label">Models</span>
-                      <strong>{provider.models.length}</strong>
-                    </div>
-                  </div>
-
-                  <div className="model-list">
-                    {provider.models.map((model) => (
-                      <span className="model-pill" key={model.id}>
-                        {model.name}
-                      </span>
-                    ))}
-                  </div>
-
-                  <div className="button-row">
-                    <button
-                      className="button button-primary"
-                      disabled={isBusy || !provider.hasOAuth}
-                      onClick={() => {
-                        void handleLogin(provider.id);
-                      }}
-                      type="button"
-                    >
-                      {isBusy ? 'Working…' : 'Connect'}
-                    </button>
-                    <button
-                      className="button button-secondary"
-                      disabled={isBusy || !provider.connected}
-                      onClick={() => {
-                        void handleLogout(provider.id);
-                      }}
-                      type="button"
-                    >
-                      Disconnect
-                    </button>
-                  </div>
-                </section>
-              );
-            })}
-          </div>
-        </article>
-
-        <article className="card activity-card">
-          <div className="card-heading">
-            <div>
-              <p className="eyebrow">Activity</p>
-              <h2>Auth event stream</h2>
-            </div>
-          </div>
-
-          <div className="activity-list">
-            {orderedEvents.length > 0 ? (
-              orderedEvents.map((event, index) => (
-                <article className="activity-item" key={`${event.timestamp}-${index}`}>
-                  <div className="activity-header">
-                    <span className={`event-dot event-${event.level}`} />
-                    <strong>{event.providerId}</strong>
-                    <span className="subtle-text">{formatTimestamp(event.timestamp)}</span>
-                  </div>
-                  <p>{event.message}</p>
-                  {event.url ? (
-                    <a className="inline-link" href={event.url} rel="noreferrer" target="_blank">
-                      {event.url}
-                    </a>
-                  ) : null}
-                </article>
-              ))
-            ) : (
-              <p className="empty-state">No auth events yet. Try Connect to exercise the flow.</p>
-            )}
-          </div>
-        </article>
-      </section>
-
-      <section className="grid playground-grid">
-        <article className="card prompt-run-card">
-          <div className="card-heading">
-            <div>
-              <p className="eyebrow">Prompt test</p>
-              <h2>First authenticated model call</h2>
-            </div>
-            <span className="subtle-text">
-              {connectedProvider && activeModel
-                ? `${connectedProvider.name} / ${activeModel.name}`
-                : 'Connect a provider to enable prompt testing'}
-            </span>
-          </div>
-
-          <p className="subtle-text">
-            This uses the first connected provider and its first model. It sends one prompt through
-            the harness transport without any tool execution yet.
-          </p>
-
-          <label className="prompt-label" htmlFor="prompt-run-input">
-            Prompt
-          </label>
-          <textarea
-            id="prompt-run-input"
-            className="text-area"
-            disabled={!connectedProvider || runningPrompt}
-            value={promptInput}
-            onChange={(event) => {
-              setPromptInput(event.target.value);
-            }}
-          />
-
-          <div className="button-row">
             <button
-              className="button button-primary"
-              disabled={
-                !connectedProvider ||
-                !activeModel ||
-                promptInput.trim().length === 0 ||
-                runningPrompt
-              }
+              className="button button-secondary"
               onClick={() => {
-                void handleRunPrompt();
+                void handleCreateSession();
               }}
               type="button"
             >
-              {runningPrompt ? 'Running…' : 'Run prompt'}
+              New chat
             </button>
           </div>
-        </article>
 
-        <article className="card prompt-response-card">
-          <div className="card-heading">
-            <div>
-              <p className="eyebrow">Response</p>
-              <h2>Model output</h2>
-            </div>
-            {promptResult?.stopReason ? (
-              <span className="status-pill status-pill-idle">{promptResult.stopReason}</span>
-            ) : null}
+          <div className="session-list">
+            {sessions.map((session) => (
+              <button
+                className={`session-item ${session.id === activeSessionId ? 'session-item-active' : ''}`}
+                key={session.id}
+                onClick={() => {
+                  void loadSession(session.id);
+                }}
+                type="button"
+              >
+                <strong>{session.title}</strong>
+                <span className="subtle-text">
+                  {session.messageCount} messages · {formatUpdatedAt(session.updatedAt)}
+                </span>
+              </button>
+            ))}
           </div>
 
-          {promptResult ? (
-            promptResult.ok ? (
-              <pre className="response-output">
-                {promptResult.responseText || '(empty response)'}
-              </pre>
-            ) : (
-              <div className="response-error">
-                <strong>Prompt failed</strong>
-                <p>{promptResult.error}</p>
-              </div>
-            )
-          ) : (
-            <p className="empty-state">
-              No model response yet. Connect OpenAI Codex, then run the test prompt.
-            </p>
-          )}
-        </article>
-      </section>
+          <details className="dev-panel">
+            <summary>Developer tools</summary>
 
-      <section className="card footer-card">
-        <div>
-          <p className="eyebrow">Storage</p>
-          <h2>Local auth state</h2>
-          <p className="subtle-text">
-            Credentials are stored locally on disk. Right now the frontend is just enough to inspect
-            providers, kick off login attempts, handle prompt handoffs, and verify the first model
-            call end to end.
-          </p>
-        </div>
-        <code className="path-chip">
-          {authOverview?.authFilePath ?? 'Loading auth file path...'}
-        </code>
+            <section className="dev-section">
+              <div className="card-heading">
+                <div>
+                  <p className="eyebrow">Auth</p>
+                  <h2>Provider connections</h2>
+                </div>
+              </div>
+
+              <div className="provider-list">
+                {authOverview?.providers.map((provider) => {
+                  const isBusy = busyProviderId === provider.id;
+
+                  return (
+                    <section className="provider-card" key={provider.id}>
+                      <div className="provider-header">
+                        <div>
+                          <h3>{provider.name}</h3>
+                          <p className="subtle-text">{provider.id}</p>
+                        </div>
+                        <span
+                          className={`status-pill ${
+                            provider.connected ? 'status-pill-connected' : 'status-pill-idle'
+                          }`}
+                        >
+                          {getConnectionLabel(provider)}
+                        </span>
+                      </div>
+
+                      <div className="model-list">
+                        {provider.models.map((model) => (
+                          <span className="model-pill" key={model.id}>
+                            {model.name}
+                          </span>
+                        ))}
+                      </div>
+
+                      <div className="button-row">
+                        <button
+                          className="button button-primary"
+                          disabled={isBusy || !provider.hasOAuth}
+                          onClick={() => {
+                            void handleLogin(provider.id);
+                          }}
+                          type="button"
+                        >
+                          {isBusy ? 'Working…' : 'Connect'}
+                        </button>
+                        <button
+                          className="button button-secondary"
+                          disabled={isBusy || !provider.connected}
+                          onClick={() => {
+                            void handleLogout(provider.id);
+                          }}
+                          type="button"
+                        >
+                          Disconnect
+                        </button>
+                      </div>
+                    </section>
+                  );
+                })}
+              </div>
+            </section>
+
+            <section className="dev-section">
+              <div className="card-heading">
+                <div>
+                  <p className="eyebrow">Events</p>
+                  <h2>Auth log</h2>
+                </div>
+              </div>
+
+              <div className="activity-list">
+                {orderedEvents.length > 0 ? (
+                  orderedEvents.map((event, index) => (
+                    <article className="activity-item" key={`${event.timestamp}-${index}`}>
+                      <div className="activity-header">
+                        <span className={`event-dot event-${event.level}`} />
+                        <strong>{event.providerId}</strong>
+                        <span className="subtle-text">{formatTimestamp(event.timestamp)}</span>
+                      </div>
+                      <p>{event.message}</p>
+                      {event.url ? (
+                        <a
+                          className="inline-link"
+                          href={event.url}
+                          rel="noreferrer"
+                          target="_blank"
+                        >
+                          {event.url}
+                        </a>
+                      ) : null}
+                    </article>
+                  ))
+                ) : (
+                  <p className="empty-state">No auth events yet.</p>
+                )}
+              </div>
+
+              <code className="path-chip">
+                {authOverview?.authFilePath ?? 'Loading auth file path...'}
+              </code>
+            </section>
+          </details>
+        </aside>
+
+        <section className="chat-pane card">
+          <div className="chat-header">
+            <div>
+              <p className="eyebrow">Conversation</p>
+              <h2>{sessionDetail?.session.title ?? 'Loading conversation...'}</h2>
+            </div>
+            <span className="subtle-text">
+              {sessionDetail ? `${sessionDetail.session.messageCount} messages` : 'Loading...'}
+            </span>
+          </div>
+
+          <div className="message-thread">
+            {isBootstrapping || isLoadingSession ? (
+              <div className="empty-thread">
+                <p>Loading conversation…</p>
+              </div>
+            ) : renderedMessages.length > 0 ? (
+              renderedMessages.map((message, index) => {
+                const roleClass =
+                  message.role === 'user'
+                    ? 'message-user'
+                    : message.role === 'assistant'
+                      ? 'message-assistant'
+                      : 'message-tool';
+                const isPending = message.id.startsWith('pending-');
+
+                return (
+                  <article className={`message-row ${roleClass}`} key={`${message.id}-${index}`}>
+                    <div className={`message-bubble ${isPending ? 'message-pending' : ''}`}>
+                      <header className="message-meta">
+                        <strong>
+                          {message.role === 'user'
+                            ? 'You'
+                            : message.role === 'assistant'
+                              ? 'Anvil'
+                              : message.toolName || 'Tool'}
+                        </strong>
+                        <span className="subtle-text">{formatTimestamp(message.timestamp)}</span>
+                      </header>
+                      <p>{messageBody(message)}</p>
+                      {message.stopReason ? (
+                        <span className="message-stop-reason">{message.stopReason}</span>
+                      ) : null}
+                    </div>
+                  </article>
+                );
+              })
+            ) : (
+              <div className="empty-thread">
+                <p>No messages yet. Start the conversation below.</p>
+              </div>
+            )}
+          </div>
+
+          <div className="composer">
+            <textarea
+              className="text-area composer-input"
+              disabled={!connectedProvider || !activeModel || !activeSessionId || isSendingMessage}
+              placeholder={
+                connectedProvider && activeModel
+                  ? 'Ask Anvil to inspect the repo, explain code, or plan a change…'
+                  : 'Connect OpenAI Codex in Developer tools to start chatting.'
+              }
+              value={composerText}
+              onChange={(event) => {
+                setComposerText(event.target.value);
+              }}
+              onKeyDown={(event) => {
+                if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                  event.preventDefault();
+                  void handleSendMessage();
+                }
+              }}
+            />
+            <div className="composer-footer">
+              <span className="subtle-text">⌘/Ctrl + Enter to send</span>
+              <button
+                className="button button-primary"
+                disabled={
+                  !connectedProvider ||
+                  !activeModel ||
+                  !activeSessionId ||
+                  composerText.trim().length === 0 ||
+                  isSendingMessage
+                }
+                onClick={() => {
+                  void handleSendMessage();
+                }}
+                type="button"
+              >
+                {isSendingMessage ? 'Sending…' : 'Send'}
+              </button>
+            </div>
+          </div>
+        </section>
       </section>
     </main>
   );
