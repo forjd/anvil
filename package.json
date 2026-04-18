@@ -2,7 +2,7 @@
   "name": "@forjd/anvil",
   "productName": "Anvil",
   "version": "0.1.0",
-  "description": "A local-first desktop coding agent for working with repositories using Codex.",
+  "description": "A desktop coding agent for local repositories, powered by Codex.",
   "private": true,
   "type": "module",
   "main": "out/main/index.js",

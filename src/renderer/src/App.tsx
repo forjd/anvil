@@ -1,5 +1,5 @@
 const goals = [
-  'Shape the MVP around a local-first repo task agent.',
+  'Shape the MVP around a desktop coding agent for local repos.',
   'Integrate Codex via app-server in a dedicated runtime process.',
   'Keep edits and command execution human-approved by default.',
 ];
@@ -17,8 +17,8 @@ export default function App() {
         <p className="eyebrow">forjd / anvil</p>
         <h1>Anvil</h1>
         <p className="lead">
-          A local-first Electron coding agent for exploring repos, proposing changes, and running
-          approved commands with Codex.
+          A desktop coding agent for local repositories, with local execution and Codex-powered
+          model calls.
         </p>
       </section>
 

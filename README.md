@@ -1,8 +1,10 @@
 # Anvil
 
-A local-first Electron coding agent for working with repositories using Codex.
+A desktop coding agent for local repositories, powered by Codex.
 
 ## Status
+
+Anvil works against a local repo and runs commands on the local machine, but it still requires an internet connection for Codex / OpenAI model calls.
 
 This repo is at the initial scaffold stage. The current focus is:
 
